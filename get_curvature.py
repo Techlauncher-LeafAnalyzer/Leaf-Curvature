@@ -17,13 +17,11 @@ def ensure_binary_leaf_mask(mask):
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
-    # Inputs are expected to be 0/1 segmentation masks, but also handle 0/255.
+    # Inputs are 0/1 segmentation masks (also handle 0/255). Convention:
+    # nonzero = leaf, zero = background. Do NOT auto-invert based on area —
+    # a leaf that fills more than half the frame would get flipped, and the
+    # external contour would then trace the image border instead of the leaf.
     mask = (mask > 0).astype(np.uint8) * 255
-
-    # Heuristic: if white occupies > half the image, invert
-    # (because usually the leaf is smaller than the background)
-    if np.count_nonzero(mask) > mask.size // 2:
-        mask = 255 - mask
 
     return mask
 
@@ -67,28 +65,38 @@ def moving_average_closed_contour(points, window_size=5):
 
 def compute_curvature_from_5_points(points5):
     """
-    Compute curvature at the middle point of 5 points
-    using a 4th-degree polynomial fit.
+    Compute curvature at the middle point of 5 boundary points using a
+    degree-4 polynomial (with 5 points and degree 4 this is an exact fit,
+    i.e., the Lagrange interpolating polynomial as specified in the paper).
 
-    For numerical stability:
-    - if x-range is larger, fit y = f(x)
-    - otherwise, fit x = f(y)
+    Paper (Sect. 4.1.2): the slope of the chord between the first and the
+    fifth point is computed. If the chord angle (in degrees, measured from
+    the x-axis and folded into [0, 180)) is > 135 or < 45, the chord is
+    near-horizontal and the polynomial is built "according to the y axis"
+    (i.e., y = f(x)). Otherwise the chord is near-vertical and the
+    polynomial is built "according to the x axis" (i.e., x = f(y)).
     """
     points5 = np.asarray(points5, dtype=np.float64)
     x = points5[:, 0]
     y = points5[:, 1]
 
-    # Choose the more stable fitting direction
-    if np.ptp(x) >= np.ptp(y):
+    # Chord angle from point 1 to point 5, folded to [0, 180).
+    angle = np.degrees(np.arctan2(y[-1] - y[0], x[-1] - x[0]))
+    if angle < 0.0:
+        angle += 180.0
+
+    if angle > 135.0 or angle < 45.0:
+        # Near-horizontal chord -> fit y = f(x)
         independent = x
         dependent = y
         t0 = x[2]
     else:
+        # Near-vertical chord -> fit x = f(y)
         independent = y
         dependent = x
         t0 = y[2]
 
-    # Need distinct independent values for fitting
+    # Need distinct independent values for an exact 5-point fit.
     if len(np.unique(independent)) < 5:
         return np.nan
 
@@ -99,8 +107,7 @@ def compute_curvature_from_5_points(points5):
     f1 = np.polyval(d1, t0)
     f2 = np.polyval(d2, t0)
 
-    curvature = abs(f2) / ((1.0 + f1 ** 2) ** 1.5)
-    return curvature
+    return abs(f2) / ((1.0 + f1 ** 2) ** 1.5)
 
 
 def curvature_series(points, fit_window=5, step=1):
@@ -336,7 +343,46 @@ def render_contour_with_score(image_shape, contour, curvature_score):
     return canvas
 
 
-def process_folder(input_folder, output_folder, step=1):
+def process_image(in_path, output_folder, step=1, save_plot=False, show_plot=False):
+    """Process a single mask image. Returns curvature value, or None on failure."""
+    fname = os.path.basename(in_path)
+    mask = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+
+    if mask is None:
+        print(f"  [skip] {fname}: could not read")
+        return None
+
+    stem, ext = os.path.splitext(fname)
+    plot_path = os.path.join(output_folder, f"{stem}_plot.png") if save_plot else None
+
+    try:
+        feature_value, debug = extract_leaf_curvature_feature(
+            binary_mask=mask,
+            close_kernel_size=3,
+            moving_avg_window=5,
+            fit_window=5,
+            sigma=2.0,
+            step=step,
+            visualize=(save_plot or show_plot),
+            show_image=show_plot,
+            save_plot_path=plot_path,
+        )
+    except Exception as exc:
+        print(f"  [skip] {fname}: {exc}")
+        return None
+
+    annotated = render_contour_with_score(mask.shape, debug["contour"], feature_value)
+    out_path = os.path.join(output_folder, f"{stem}_curvature{ext}")
+    cv2.imwrite(out_path, annotated)
+
+    msg = f"  {fname}: curvature = {feature_value:.6f} -> {out_path}"
+    if plot_path:
+        msg += f" (plot: {plot_path})"
+    print(msg)
+    return feature_value
+
+
+def process_folder(input_folder, output_folder, step=1, save_plot=False, show_plot=False):
     if not os.path.isdir(input_folder):
         raise NotADirectoryError(f"Input folder does not exist: {input_folder}")
 
@@ -354,50 +400,30 @@ def process_folder(input_folder, output_folder, step=1):
 
     for fname in files:
         in_path = os.path.join(input_folder, fname)
-        mask = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
-
-        if mask is None:
-            print(f"  [skip] {fname}: could not read")
-            continue
-
-        try:
-            feature_value, debug = extract_leaf_curvature_feature(
-                binary_mask=mask,
-                close_kernel_size=3,
-                moving_avg_window=5,
-                fit_window=5,
-                sigma=2.0,
-                step=step,
-                visualize=False,
-            )
-        except Exception as exc:
-            print(f"  [skip] {fname}: {exc}")
-            continue
-
-        annotated = render_contour_with_score(mask.shape, debug["contour"], feature_value)
-
-        stem, ext = os.path.splitext(fname)
-        out_path = os.path.join(output_folder, f"{stem}_curvature{ext}")
-        cv2.imwrite(out_path, annotated)
-
-        print(f"  {fname}: curvature = {feature_value:.6f} -> {out_path}")
+        process_image(
+            in_path,
+            output_folder,
+            step=step,
+            save_plot=save_plot,
+            show_plot=show_plot,
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compute leaf curvature for every binary mask image in a folder."
+        description="Compute leaf curvature for a binary mask image, or every "
+                    "binary mask image in a folder."
     )
     parser.add_argument(
-        "input_folder",
-        nargs="?",
+        "-i", "--input",
         default="input",
-        help="Folder containing binary mask images (0/1 or 0/255). Default: ./input",
+        help="A mask image file OR a folder containing mask images. Default: ./input",
     )
     parser.add_argument(
-        "output_folder",
-        nargs="?",
+        "-o", "--output",
+        dest="output_folder",
         default="output",
-        help="Folder to write annotated images into. Default: ./output",
+        help="Folder to write annotated images (and plots) into. Default: ./output",
     )
     parser.add_argument(
         "--step",
@@ -405,10 +431,42 @@ if __name__ == "__main__":
         default=5,
         help="Curvature sampling step. Use 5 for stricter 5-point interval sampling.",
     )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Save the 5-panel matplotlib debug plot for each image "
+             "as <stem>_plot.png in the output folder.",
+    )
+    parser.add_argument(
+        "--show-plot",
+        action="store_true",
+        help="Also display the debug plot interactively (blocks until closed). "
+             "Implies --plot's figure generation but does not require saving.",
+    )
     args = parser.parse_args()
 
-    try:
-        process_folder(args.input_folder, args.output_folder, step=args.step)
-    except NotADirectoryError as exc:
-        print(exc, file=sys.stderr)
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    if os.path.isfile(args.input):
+        process_image(
+            args.input,
+            args.output_folder,
+            step=args.step,
+            save_plot=args.plot,
+            show_plot=args.show_plot,
+        )
+    elif os.path.isdir(args.input):
+        try:
+            process_folder(
+                args.input,
+                args.output_folder,
+                step=args.step,
+                save_plot=args.plot,
+                show_plot=args.show_plot,
+            )
+        except NotADirectoryError as exc:
+            print(exc, file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Input path does not exist: {args.input}", file=sys.stderr)
         sys.exit(1)

@@ -3,3 +3,4 @@ curvature_debug.png
 /output/*
 __pycache__
 .vscode
+*pdf
