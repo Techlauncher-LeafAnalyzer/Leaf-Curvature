@@ -1,6 +1,12 @@
+import argparse
+import os
+import sys
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
 def ensure_binary_leaf_mask(mask):
@@ -11,7 +17,8 @@ def ensure_binary_leaf_mask(mask):
     if mask.ndim == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
 
-    mask = (mask > 127).astype(np.uint8) * 255
+    # Inputs are expected to be 0/1 segmentation masks, but also handle 0/255.
+    mask = (mask > 0).astype(np.uint8) * 255
 
     # Heuristic: if white occupies > half the image, invert
     # (because usually the leaf is smaller than the background)
@@ -293,19 +300,115 @@ def extract_leaf_curvature_feature(
 
     return feature_value, debug_info
 
-if __name__ == "__main__":
-    mask = cv2.imread("image-with-apriltags (2)_binary_mask.png", cv2.IMREAD_GRAYSCALE)
+def render_contour_with_score(image_shape, contour, curvature_score):
+    """
+    Render the detected boundary points on a black canvas the same size as the
+    input mask, then overlay the curvature score in the top-right in vivid red.
+    """
+    h, w = image_shape[:2]
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
-    feature_value, debug = extract_leaf_curvature_feature(
-        binary_mask=mask,
-        close_kernel_size=3,
-        moving_avg_window=5,
-        fit_window=5,
-        sigma=2.0,
-        step=1,                 # use step=5 if you want a stricter "5-point interval" sampling
-        visualize=True,         # this makes the 4 plots appear during the run
-        show_image=True,
-        save_plot_path="curvature_debug.png"
+    # Plot each detected boundary point as a single pixel (green, BGR).
+    pts = np.round(np.asarray(contour)).astype(np.int32)
+    xs = np.clip(pts[:, 0], 0, w - 1)
+    ys = np.clip(pts[:, 1], 0, h - 1)
+    canvas[ys, xs] = (0, 255, 0)
+
+    text = f"Curvature: {curvature_score:.6f}" if np.isfinite(curvature_score) else "Curvature: nan"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.6, min(w, h) / 900.0)
+    thickness = max(2, int(round(font_scale * 2)))
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    margin = max(10, int(round(font_scale * 15)))
+    x = w - text_w - margin
+    y = margin + text_h
+
+    cv2.rectangle(
+        canvas,
+        (x - 6, y - text_h - 6),
+        (x + text_w + 6, y + baseline + 6),
+        (0, 0, 0),
+        thickness=cv2.FILLED,
     )
+    cv2.putText(canvas, text, (x, y), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
+    return canvas
 
-    print("Final curvature feature =", feature_value)
+
+def process_folder(input_folder, output_folder, step=1):
+    if not os.path.isdir(input_folder):
+        raise NotADirectoryError(f"Input folder does not exist: {input_folder}")
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    files = sorted(
+        f for f in os.listdir(input_folder)
+        if f.lower().endswith(IMAGE_EXTS)
+    )
+    if not files:
+        print(f"No images found in {input_folder}")
+        return
+
+    print(f"Found {len(files)} image(s) in {input_folder}")
+
+    for fname in files:
+        in_path = os.path.join(input_folder, fname)
+        mask = cv2.imread(in_path, cv2.IMREAD_GRAYSCALE)
+
+        if mask is None:
+            print(f"  [skip] {fname}: could not read")
+            continue
+
+        try:
+            feature_value, debug = extract_leaf_curvature_feature(
+                binary_mask=mask,
+                close_kernel_size=3,
+                moving_avg_window=5,
+                fit_window=5,
+                sigma=2.0,
+                step=step,
+                visualize=False,
+            )
+        except Exception as exc:
+            print(f"  [skip] {fname}: {exc}")
+            continue
+
+        annotated = render_contour_with_score(mask.shape, debug["contour"], feature_value)
+
+        stem, ext = os.path.splitext(fname)
+        out_path = os.path.join(output_folder, f"{stem}_curvature{ext}")
+        cv2.imwrite(out_path, annotated)
+
+        print(f"  {fname}: curvature = {feature_value:.6f} -> {out_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Compute leaf curvature for every binary mask image in a folder."
+    )
+    parser.add_argument(
+        "input_folder",
+        nargs="?",
+        default="input",
+        help="Folder containing binary mask images (0/1 or 0/255). Default: ./input",
+    )
+    parser.add_argument(
+        "output_folder",
+        nargs="?",
+        default="output",
+        help="Folder to write annotated images into. Default: ./output",
+    )
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=5,
+        help="Curvature sampling step. Use 5 for stricter 5-point interval sampling.",
+    )
+    args = parser.parse_args()
+
+    try:
+        process_folder(args.input_folder, args.output_folder, step=args.step)
+    except NotADirectoryError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)

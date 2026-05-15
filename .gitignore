@@ -1,0 +1,5 @@
+curvature_debug.png
+.claude/
+/output/*
+__pycache__
+.vscode
