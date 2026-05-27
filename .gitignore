@@ -1,6 +1,7 @@
 curvature_debug.png
 .claude/
 /output/*
+!output/1-with-apriltags_binary_mask_curvature.png
 __pycache__
 .vscode
 *pdf
